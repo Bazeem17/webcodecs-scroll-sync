@@ -32,19 +32,24 @@ export function Canvas({ src }: CanvasProps) {
 
       if (currentFrame) {
         videoCtx.clearRect(0, 0, canvas.width, canvas.height);
-        backgroundCtx.clearRect(0, 0, backgroundCanvas.width, backgroundCanvas.height);
-
+        
         videoCtx.drawImage(currentFrame, 0, 0, canvas.width, canvas.height);
 
-        backgroundCtx.filter = 'blur(20px)';
-        const blurOffset = 40; // 2x the blur radius for safe coverage
-        backgroundCtx.drawImage(
-          canvas,
-          -blurOffset,
-          -blurOffset,
-          backgroundCanvas.width + blurOffset * 2,
-          backgroundCanvas.height + blurOffset * 2
-        );
+        // Only draw background canvas if screen is wider than 16:9
+        const screenAspectRatio = window.innerWidth / window.innerHeight;
+        if (screenAspectRatio > ASPECT_RATIO) {
+          backgroundCtx.clearRect(0, 0, backgroundCanvas.width, backgroundCanvas.height);
+          
+          backgroundCtx.filter = 'blur(20px)';
+          const blurOffset = 40; // 2x the blur radius for safe coverage
+          backgroundCtx.drawImage(
+            canvas,
+            -blurOffset,
+            -blurOffset,
+            backgroundCanvas.width + blurOffset * 2,
+            backgroundCanvas.height + blurOffset * 2
+          );
+        }
       }
 
       requestAnimationFrame(drawFrame);
@@ -108,11 +113,18 @@ export function Canvas({ src }: CanvasProps) {
     canvas.width = Math.floor(width * scale);
     canvas.height = Math.floor(height * scale);
 
-    // Resize background canvas to cover the entire screen
-    backgroundCanvas.style.width = `${window.innerWidth}px`;
-    backgroundCanvas.style.height = `${window.innerHeight}px`;
-    backgroundCanvas.width = Math.floor(window.innerWidth * scale);
-    backgroundCanvas.height = Math.floor(window.innerHeight * scale);
+    const screenAspectRatio = window.innerWidth / window.innerHeight;
+    if (screenAspectRatio > ASPECT_RATIO) {
+      // Resize background canvas to cover the entire screen
+      backgroundCanvas.style.width = `${window.innerWidth}px`;
+      backgroundCanvas.style.height = `${window.innerHeight}px`;
+      backgroundCanvas.width = Math.floor(window.innerWidth * scale);
+      backgroundCanvas.height = Math.floor(window.innerHeight * scale);
+      backgroundCanvas.style.display = 'block';
+    } else {
+      // Hide background canvas on narrow screens
+      backgroundCanvas.style.display = 'none';
+    }
   };
 
   return (
