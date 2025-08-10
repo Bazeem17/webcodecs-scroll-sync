@@ -2,21 +2,19 @@ import { EncodedPacketSink, Input, MP4, UrlSource } from "mediabunny";
 import { assert } from "./utils";
 
 /**
- * Keep this many microseconds of video in the buffer (to each side)
+ * Keep this many microseconds of video in the buffer
  */
-const BUFFER_RANGE = 1_000_000; // microseconds (2 seconds in total)
+const BUFFER_RANGE = 1_000_000; // microseconds (1 second to each side)
 /**
- * Start decoding when <DECODE_THRESHOLD> many frames are needed
+ * Start decoding when DECODE_THRESHOLD many frames are needed
  */
-const DECODE_THRESHOLD = 40; // frames
-/**
- * Desired playback rate
- */
-const FPS = 60; // frames per second
+const DECODE_THRESHOLD = 10; // frames
 
 export class FrameDecoder {
-  private chunks: EncodedVideoChunk[] = [];
-  private buffer: VideoFrame[] = [];
+  private encodedChunks: EncodedVideoChunk[] = [];
+  private frameBuffer: Map<number, VideoFrame> = new Map();
+  private decoderQueue: Map<number, PromiseWithResolvers<void>> = new Map();
+  private decoderIndex: number = 0;
   private decoder: VideoDecoder | null = null;
 
   private duration: number = 0;
@@ -25,34 +23,24 @@ export class FrameDecoder {
   private processing: boolean = false;
 
   private currentTimestamp: number = 0;
-  private nextTimestamp: number = 0;
-
-  private decoderPointer: number | null = null;
   private loading: boolean = false;
 
   /**
    * Get the frame that should be painted
    */
   public get frame(): VideoFrame | null {
-    if (this.buffer.length === 0) return null;
+    let minDiff = Infinity;
+    let bestFrame: VideoFrame | null = null;
 
-    let left = 0;
-    let right = this.buffer.length - 1;
-    let result: VideoFrame | null = null;
-
-    while (left <= right) {
-      const mid = Math.floor((left + right) / 2);
-      const frame = this.buffer[mid];
-
-      if (frame.timestamp >= this.currentTimestamp) {
-        result = frame;
-        right = mid - 1;
-      } else {
-        left = mid + 1;
+    for (const [timestamp, frame] of this.frameBuffer) {
+      const diff = Math.abs(timestamp - this.currentTimestamp);
+      if (diff < minDiff) {
+        minDiff = diff;
+        bestFrame = frame;
       }
     }
 
-    return result;
+    return bestFrame;
   }
 
   /**
@@ -60,25 +48,14 @@ export class FrameDecoder {
    * @param timestamp - The target timestamp in microseconds
    */
   private findClosestChunkIndex(timestamp: number): number {
-    let left = 0;
-    let right = this.chunks.length - 1;
-    let bestIndex = 0;
     let minDiff = Infinity;
+    let bestIndex: number = 0;
 
-    while (left <= right) {
-      const mid = Math.floor((left + right) / 2);
-      const chunk = this.chunks[mid];
-      const diff = Math.abs(chunk.timestamp - timestamp);
-
+    for (let i = 0; i < this.encodedChunks.length; i++) {
+      const diff = Math.abs(timestamp - this.encodedChunks[i].timestamp);
       if (diff < minDiff) {
         minDiff = diff;
-        bestIndex = mid;
-      }
-
-      if (chunk.timestamp < timestamp) {
-        left = mid + 1;
-      } else {
-        right = mid - 1;
+        bestIndex = i;
       }
     }
 
@@ -92,7 +69,7 @@ export class FrameDecoder {
   private findClosestKeyFrameIndex(startIndex: number): number {
     // Search backwards from startIndex to find the nearest key frame
     for (let i = startIndex; i >= 0; i--) {
-      if (this.chunks[i].type === 'key') {
+      if (this.encodedChunks[i].type === 'key') {
         return i;
       }
     }
@@ -105,7 +82,7 @@ export class FrameDecoder {
    * @param fraction - The fraction of the video to seek to (0-1)
    */
   public seek(fraction: number): void {
-    if (this.buffer.length === 0) return;
+    if (this.frameBuffer.size === 0) return;
 
     this.seekQueue.push(fraction);
 
@@ -150,18 +127,14 @@ export class FrameDecoder {
       return;
     }
 
-    this.nextTimestamp = nextTimestamp;
-
-    const firstFrameTimestamp = this.buffer[0]?.timestamp ?? 0;
-    const lastFrameTimestamp = this.buffer[this.buffer.length - 1]?.timestamp ?? 0;
-
-    // Check if outside bounds, and include forward tolerance
-    const outsideBuffer = nextTimestamp < firstFrameTimestamp
-      || nextTimestamp > lastFrameTimestamp + BUFFER_RANGE / 2;
+    const timestamps = Array.from(this.frameBuffer.keys());
+    const lowerBound = Math.min(...timestamps) - BUFFER_RANGE;
+    const upperBound = Math.max(...timestamps) + BUFFER_RANGE;
 
     let startIndex: number = 0;
     let endIndex: number = 0;
-    if (outsideBuffer) {
+
+    if (nextTimestamp < lowerBound || nextTimestamp > upperBound) {
       // Case 1: We need a new buffer
       endIndex = this.findClosestChunkIndex(nextTimestamp + BUFFER_RANGE);
       startIndex = this.findClosestChunkIndex(nextTimestamp - BUFFER_RANGE);
@@ -170,19 +143,24 @@ export class FrameDecoder {
       // Case 2: We need to decode backwards
       startIndex = this.findClosestChunkIndex(nextTimestamp - BUFFER_RANGE);
       startIndex = this.findClosestKeyFrameIndex(startIndex);
+
+      const timestamp = Math.min(
+        ...Array.from(this.frameBuffer.keys()),
+        ...Array.from(this.decoderQueue.keys()),
+      );
       // Decode up to the first frame in the buffer
-      endIndex = this.findClosestChunkIndex(firstFrameTimestamp) - 1;
+      endIndex = this.findClosestChunkIndex(timestamp) - 1;
     } else if (nextTimestamp > prevTimestamp) {
       // Case 3: We need to decode forwards
-      startIndex = this.decoderPointer ?? 0;
       endIndex = this.findClosestChunkIndex(nextTimestamp + BUFFER_RANGE);
+      startIndex = this.decoderIndex;
     }
 
-    this.decodeChunks(startIndex, endIndex);
-    await this.play(nextTimestamp);
+    this.play(nextTimestamp);
+    await this.decodeChunks(startIndex, endIndex);
   }
 
-  private decodeChunks(startIndex: number, endIndex: number) {
+  private async decodeChunks(startIndex: number, endIndex: number) {
     if (endIndex - startIndex <= DECODE_THRESHOLD) {
       return;
     }
@@ -190,71 +168,76 @@ export class FrameDecoder {
     for (let i = startIndex; i < endIndex; i++) {
       this.decodeChunkAt(i);
     }
+
+    await this.decoderQueue.values().next().value?.promise;
   }
 
   private decodeChunkAt(index: number) {
     // Clamp the index to the valid range
-    index = Math.min(Math.max(0, index), this.chunks.length - 1);
+    index = Math.min(Math.max(0, index), this.encodedChunks.length - 1);
+    const chunk = this.encodedChunks[index];
 
-    this.decoder?.decode(this.chunks[index]);
-    this.decoderPointer = index;
+    // add the chunk to the queue
+    this.decoderQueue.set(chunk.timestamp, Promise.withResolvers<void>());
+    this.decoder?.decode(chunk);
+    this.decoderIndex = index;
   }
 
   /**
    * Play the video at the given timestamp
    * @param timestamp - The timestamp to play the video to in microseconds
    */
-  public async play(timestamp: number): Promise<void> {
-    const delta = Math.abs(this.currentTimestamp - timestamp);
+  public play(timestamp: number): void {
+    const targetIndex = this.findClosestChunkIndex(timestamp);
+    let currentIndex = this.findClosestChunkIndex(this.currentTimestamp);
 
-    // Time jump is too large
-    if (delta > BUFFER_RANGE) {
-      this.currentTimestamp = timestamp;
-      return;
+    // Could also be a while loop, but this is safer
+    for (let i = 0; i < this.encodedChunks.length; i++) {
+      if (currentIndex === targetIndex) {
+        break;
+      } else if (currentIndex > targetIndex) {
+        currentIndex--;
+      } else {
+        currentIndex++;
+      }
+
+      // update and wait for the next frame
+      this.currentTimestamp = this.encodedChunks[currentIndex].timestamp;
     }
 
-    const frames = Math.floor(delta / 1_000_000 * FPS);
-    const direction = timestamp > this.currentTimestamp ? 1 : -1;
-
-    for (let i = 0; i < frames; i++) {
-      this.currentTimestamp += direction * 1_000_000 / FPS;
-    }
+    this.currentTimestamp = this.encodedChunks[targetIndex].timestamp;
   }
 
   public destroy(): void {
-    this.buffer.forEach(frame => frame.close());
-    this.buffer = [];
-    this.chunks = [];
-    this.decoderPointer = null;
+    this.frameBuffer.forEach(frame => frame.close());
+    this.frameBuffer.clear();
+    this.encodedChunks = [];
+    this.decoderQueue.clear();
     this.decoder?.close();
     this.decoder = null;
+    this.decoderIndex = 0;
   }
 
   private frameCallback(frame: VideoFrame): void {
-    // Make sure we don't remove frames that could be needed for playback
-    const lowerBound = Math.min(this.nextTimestamp, this.currentTimestamp) - BUFFER_RANGE;
-    const upperBound = Math.max(this.nextTimestamp, this.currentTimestamp) + BUFFER_RANGE;
-
-    // remove frames outside range in a single pass
-    const framesToRemove: VideoFrame[] = [];
-    const framesToKeep: VideoFrame[] = [];
-
-    for (const f of this.buffer) {
-      if (f.timestamp < lowerBound || f.timestamp > upperBound || f.timestamp === frame.timestamp) {
-        framesToRemove.push(f);
-      } else {
-        framesToKeep.push(f);
-      }
+    if (this.decoderQueue.has(frame.timestamp)) {
+      this.decoderQueue.get(frame.timestamp)?.resolve();
+      this.decoderQueue.delete(frame.timestamp);
     }
 
-    // Clean up frames to remove
-    framesToRemove.forEach(f => f.close());
+    this.frameBuffer.set(frame.timestamp, frame);
 
-    // Add new frame and sort
-    framesToKeep.push(frame);
-    framesToKeep.sort((a, b) => a.timestamp - b.timestamp);
+    // Make sure we don't remove frames that could be needed for playback
+    const lowerBound = this.currentTimestamp - BUFFER_RANGE;
+    const upperBound = this.currentTimestamp + BUFFER_RANGE;
 
-    this.buffer = framesToKeep;
+    for (const frame of this.frameBuffer.values()) {
+      // remove frames outside the range
+      if (frame.timestamp < lowerBound || frame.timestamp > upperBound) {
+        this.frameBuffer.delete(frame.timestamp);
+        frame.close();
+        continue;
+      }
+    }
   }
 
   /**
@@ -284,20 +267,20 @@ export class FrameDecoder {
     assert(config, "No decoder config found");
     decoder.configure(config);
 
-    this.chunks = [];
-    this.decoderPointer = 0;
+    this.encodedChunks = [];
     this.decoder = decoder;
+    this.decoderIndex = 0;
 
     const sink = new EncodedPacketSink(videoTrack);
 
     for await (const packet of sink.packets()) {
       const chunk = packet.toEncodedVideoChunk();
-      this.chunks.push(chunk);
+      this.encodedChunks.push(chunk);
 
       // Decode initial frames for fast painting
       if (chunk.timestamp <= BUFFER_RANGE) {
-        this.decodeChunkAt(this.decoderPointer);
-        this.decoderPointer++;
+        this.decodeChunkAt(this.decoderIndex);
+        this.decoderIndex++;
       }
     }
 
