@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { FrameDecoder } from "./decoder";
 import { assert } from "./utils";
 
@@ -15,6 +15,7 @@ export function Canvas({ src }: CanvasProps) {
   const backgroundCanvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const resizeObserver = useRef<ResizeObserver>(null);
+  const [frameDecoder] = useState(() => new FrameDecoder());
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -27,30 +28,26 @@ export function Canvas({ src }: CanvasProps) {
     assert(videoCtx, "No context found");
     assert(backgroundCtx, "No background context found");
 
-    const drawFrame = () => {
-      const { frame: currentFrame } = frameDecoder;
+    const drawFrame = async () => {
+      videoCtx.clearRect(0, 0, canvas.width, canvas.height);
+      frameDecoder.drawFrame(videoCtx, canvas.width, canvas.height);
+      const screenAspectRatio = window.innerWidth / window.innerHeight;
 
-      if (currentFrame) {
-        videoCtx.clearRect(0, 0, canvas.width, canvas.height);
-        
-        videoCtx.drawImage(currentFrame, 0, 0, canvas.width, canvas.height);
-
-        // Only draw background canvas if screen is wider than 16:9
-        const screenAspectRatio = window.innerWidth / window.innerHeight;
-        if (screenAspectRatio > ASPECT_RATIO) {
-          backgroundCtx.clearRect(0, 0, backgroundCanvas.width, backgroundCanvas.height);
-          
-          backgroundCtx.filter = 'blur(20px)';
-          const blurOffset = 40; // 2x the blur radius for safe coverage
-          backgroundCtx.drawImage(
-            canvas,
-            -blurOffset,
-            -blurOffset,
-            backgroundCanvas.width + blurOffset * 2,
-            backgroundCanvas.height + blurOffset * 2
-          );
-        }
+      if (screenAspectRatio < ASPECT_RATIO) {
+        return requestAnimationFrame(drawFrame);
       }
+
+      backgroundCtx.clearRect(0, 0, backgroundCanvas.width, backgroundCanvas.height);
+
+      backgroundCtx.filter = 'blur(20px)';
+      const blurOffset = 40; // 2x the blur radius for safe coverage
+      backgroundCtx.drawImage(
+        canvas,
+        -blurOffset,
+        -blurOffset,
+        backgroundCanvas.width + blurOffset * 2,
+        backgroundCanvas.height + blurOffset * 2
+      );
 
       requestAnimationFrame(drawFrame);
     };
@@ -59,11 +56,13 @@ export function Canvas({ src }: CanvasProps) {
   }, []);
 
   useEffect(() => {
-    const handleScroll = () => {
+    const handleScroll = async () => {
+      if (!frameDecoder) return;
+
       const scrollY = window.scrollY;
       const maxScrollY = document.documentElement.scrollHeight - window.innerHeight;
       const fraction = Math.max(0, Math.min(1, scrollY / maxScrollY));
-      frameDecoder.seek(fraction);
+      await frameDecoder.seek(fraction);
     };
 
     window.addEventListener('scroll', handleScroll, { passive: true });
@@ -94,6 +93,7 @@ export function Canvas({ src }: CanvasProps) {
       const fraction = Math.max(0, Math.min(1, scrollY / maxScrollY));
       await frameDecoder.seek(fraction);
     })();
+
     return () => frameDecoder.destroy();
   }, [src]);
 
