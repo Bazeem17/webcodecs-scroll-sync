@@ -52,10 +52,8 @@ const canvas = document.getElementById('myCanvas');
 const ctx = canvas.getContext('2d');
 
 const drawFrame = () => {
-  const { frame } = frameDecoder;
-  if (frame) {
-    ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
-  }
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  frameDecoder.drawFrame(ctx, canvas.width, canvas.height);
   requestAnimationFrame(drawFrame);
 };
 
