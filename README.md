@@ -25,10 +25,10 @@ The `FrameDecoder` must be initialized with a video URL:
 ```javascript
 import { FrameDecoder } from './decoder';
 
-const frameDecoder = new FrameDecoder();
+const decoder = new FrameDecoder();
 
 // Initialize with video URL
-await frameDecoder.init('https://example.com/your-video.mp4');
+await decoder.init('https://example.com/your-video.mp4');
 ```
 
 ### 2. Seek to Video Position
@@ -37,10 +37,10 @@ Use the `seek()` method to jump to specific video positions based on scroll:
 
 ```javascript
 // Seek to 50% through the video
-frameDecoder.seek(0.5);
+decoder.seek(0.5);
 
-// Get current frame for rendering
-const currentFrame = frameDecoder.frame;
+// Render the current frame
+decoder.drawFrame(ctx, canvas.width, canvas.height);
 ```
 
 ### 3. Render Frames
@@ -52,8 +52,7 @@ const canvas = document.getElementById('myCanvas');
 const ctx = canvas.getContext('2d');
 
 const drawFrame = () => {
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  frameDecoder.drawFrame(ctx, canvas.width, canvas.height);
+  decoder.drawFrame(ctx, canvas.width, canvas.height);
   requestAnimationFrame(drawFrame);
 };
 
